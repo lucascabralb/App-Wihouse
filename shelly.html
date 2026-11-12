@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0C0C0D">
+<title>Shelly</title>
+<style>
+  :root{--bg:#0C0C0D;--card:#161618;--line:rgba(255,255,255,.08);--txt:#f2f2f4;--mut:rgba(255,255,255,.45);--on:#C9A84C;--err:#e5484d}
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,sans-serif;min-height:100vh}
+  .wrap{max-width:480px;margin:0 auto;padding:36px 18px 90px}
+  h1{font-size:30px;font-weight:800;letter-spacing:-.5px;margin-bottom:28px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:22px;margin-bottom:16px;transition:border-color .3s, box-shadow .3s}
+  .card.is-on{border-color:rgba(201,168,76,.5);box-shadow:0 0 30px rgba(201,168,76,.14)}
+  .top{display:flex;align-items:center;gap:14px;margin-bottom:20px}
+  .bulb{width:52px;height:52px;border-radius:50%;display:grid;place-items:center;background:#222225;flex-shrink:0;transition:all .3s}
+  .bulb svg{width:28px;height:28px;stroke:var(--mut);fill:none;stroke-width:1.8;transition:stroke .3s}
+  .is-on .bulb{background:rgba(201,168,76,.2);box-shadow:0 0 22px rgba(201,168,76,.4)}
+  .is-on .bulb svg{stroke:var(--on)}
+  .name{font-size:20px;font-weight:700}
+  .state{font-size:14px;font-weight:600;margin-top:3px;color:var(--mut)}
+  .is-on .state{color:var(--on)}
+  .state.offline{color:var(--err)}
+  .btns{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .b{border:1px solid var(--line);border-radius:16px;padding:20px 0;font-weight:800;font-size:18px;cursor:pointer;background:#222225;color:var(--txt);transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
+  .b:active{transform:scale(.97)}
+  .b.sel-on{background:var(--on);color:#0C0C0D;border-color:var(--on)}
+  .b.sel-off{background:#3a3a3e;border-color:rgba(255,255,255,.2)}
+  .b:disabled{opacity:.35;cursor:default}
+  .spin{width:18px;height:18px;border-radius:50%;border:3px solid currentColor;border-top-color:transparent;animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .msg{font-size:15px;color:var(--mut);text-align:center;padding:40px 10px}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(30px);opacity:0;background:#222225;border:1px solid var(--line);color:var(--txt);padding:13px 20px;border-radius:14px;font-size:15px;font-weight:600;transition:all .25s;max-width:calc(100% - 36px);text-align:center;pointer-events:none}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.err{color:#ffb4b6;border-color:rgba(229,72,77,.5)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Shelly</h1>
+  <div id="list"></div>
+  <div id="msg" class="msg">Carregando...</div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+// ===== Configuração (feita pelo integrador) =====
+const HOST = 'shelly-243-eu.shelly.cloud';
+const KEY  = 'M2Y0ZWE0dWlk6C4518F0F089C5599DF2F50E28CDAF768BC19A3A9D4D768AB8D24E972E262E93166F6778F04E9370';
+// Nomes que o cliente vê. Formato: 'idDoDispositivo:canal': 'Nome'
+const NOMES = {
+  'd0cf13cfab74:0': 'Luz'
+};
+// ================================================
+
+const POLL_MS = 4000;
+let devices = {}, lastCall = 0, loading = false;
+const $ = id => document.getElementById(id);
+const wait = ms => new Promise(r => setTimeout(r, ms));
+
+let queue = Promise.resolve();
+function api(fn){
+  const run = queue.then(async () => { const w = 1100 - (Date.now() - lastCall); if (w > 0) await wait(w); lastCall = Date.now(); return fn(); });
+  queue = run.catch(() => {});
+  return run;
+}
+
+let toastT;
+function toast(t, err){
+  const el = $('toast'); el.textContent = t; el.className = 'toast show' + (err ? ' err' : '');
+  clearTimeout(toastT); toastT = setTimeout(() => el.className = 'toast', 2500);
+}
+
+function parseChannels(st){
+  const ch = [];
+  if (Array.isArray(st.relays)) st.relays.forEach((r, i) => ch.push({ ch: i, on: !!r.ison }));
+  Object.keys(st).forEach(k => { const m = k.match(/^switch:(\d+)$/); if (m) ch.push({ ch: +m[1], on: !!st[k].output }); });
+  return ch;
+}
+
+async function fetchAll(){
+  const res = await api(() => fetch(`https://${HOST}/device/all_status`, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `auth_key=${encodeURIComponent(KEY)}`
+  }));
+  const j = await res.json();
+  if (!j.isok) throw new Error('resposta inválida');
+  return j.data.devices_status || {};
+}
+
+function applyStatus(ds){
+  const seen = new Set();
+  Object.keys(ds).forEach(id => {
+    const st = ds[id];
+    const online = st.cloud ? st.cloud.connected !== false : true;
+    parseChannels(st).forEach(c => {
+      const k = id + ':' + c.ch; seen.add(k);
+      const prev = devices[k] || {};
+      devices[k] = { ...prev, id, ch: c.ch, online, real: c.on, on: prev.pending ? prev.on : c.on };
+    });
+  });
+  Object.keys(devices).forEach(k => { if (!seen.has(k)) delete devices[k]; });
+}
+
+async function load(silent){
+  if (loading) return; loading = true;
+  try {
+    applyStatus(await fetchAll());
+    render();
+    $('msg').textContent = Object.keys(devices).length ? '' : 'Nenhum dispositivo encontrado.';
+  } catch (e) {
+    if (!Object.keys(devices).length) $('msg').textContent = 'Sem conexão. Verifique a internet.';
+    else if (!silent) toast('Sem conexão. Tente de novo.', true);
+  } finally { loading = false; }
+}
+
+const BULB = '<svg viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.4 1 1.1 1 1.8V16h5v-.3c0-.7.4-1.4 1-1.8A6 6 0 0 0 12 3z"/></svg>';
+
+function nameOf(k, i){ return NOMES[k] || ('Dispositivo ' + (i + 1)); }
+
+function render(){
+  const list = $('list'); list.innerHTML = '';
+  Object.keys(devices).sort().forEach((k, i) => {
+    const d = devices[k];
+    const nm = nameOf(k, i);
+    const state = !d.online ? 'Sem conexão' : d.pending ? (d.on ? 'Ligando...' : 'Desligando...') : (d.on ? 'Ligado' : 'Desligado');
+    const el = document.createElement('div');
+    el.className = 'card' + (d.online && d.on ? ' is-on' : '');
+    const dis = (!d.online || d.pending) ? 'disabled' : '';
+    const spinOn = d.pending && d.on ? '<span class="spin"></span>' : '';
+    const spinOff = d.pending && !d.on ? '<span class="spin"></span>' : '';
+    el.innerHTML = `
+      <div class="top">
+        <div class="bulb">${BULB}</div>
+        <div>
+          <div class="name">${escapeHtml(nm)}</div>
+          <div class="state ${d.online ? '' : 'offline'}">${state}</div>
+        </div>
+      </div>
+      <div class="btns">
+        <button class="b ${d.online && d.on ? 'sel-on' : ''}" ${dis}>${spinOn}Ligar</button>
+        <button class="b ${d.online && !d.on ? 'sel-off' : ''}" ${dis}>${spinOff}Desligar</button>
+      </div>`;
+    const [bOn, bOff] = el.querySelectorAll('.b');
+    bOn.onclick = () => send(k, true, nm);
+    bOff.onclick = () => send(k, false, nm);
+    list.appendChild(el);
+  });
+}
+
+async function send(k, on, nm){
+  const d = devices[k]; if (!d || d.pending) return;
+  if (d.on === on && !d.pending) { toast(`${nm} já está ${on ? 'ligado' : 'desligado'}`); return; }
+  const before = d.on;
+  d.pending = true; d.on = on; render();
+  try {
+    const res = await api(() => fetch(`https://${HOST}/v2/devices/api/set/switch?auth_key=${encodeURIComponent(KEY)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: d.id, channel: d.ch, on })
+    }));
+    if (!res.ok) throw new Error();
+    let ok = false;
+    for (let i = 0; i < 4 && !ok; i++) {
+      await wait(600);
+      applyStatus(await fetchAll());
+      if (devices[k] && devices[k].real === on) ok = true;
+    }
+    if (devices[k]) { devices[k].pending = false; devices[k].on = devices[k].real; }
+    render();
+    if (ok) toast(`${nm} ${on ? 'ligado' : 'desligado'}`);
+    else toast(`${nm} não respondeu. Tente de novo.`, true);
+  } catch (e) {
+    if (devices[k]) { devices[k].pending = false; devices[k].on = before; }
+    render();
+    toast('Não foi possível enviar. Tente de novo.', true);
+  }
+}
+
+function escapeHtml(s){ return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+load();
+setInterval(() => { if (!document.hidden && !Object.values(devices).some(d => d.pending)) load(true); }, POLL_MS);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(true); });
+</script>
+</body>
+</html>
